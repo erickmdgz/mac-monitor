@@ -8,16 +8,23 @@
     <array>
         <string>/usr/bin/python3</string>
         <string>__TICK_PY__</string>
+        <string>--daemon</string>
+        <string>--interval</string>
+        <string>30</string>
     </array>
-    <key>StartInterval</key>
-    <integer>30</integer>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
     <key>StandardOutPath</key>
     <string>__LOG_OUT__</string>
     <key>StandardErrorPath</key>
     <string>__LOG_ERR__</string>
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
+    <key>LowPriorityIO</key>
+    <true/>
 </dict>
 </plist>

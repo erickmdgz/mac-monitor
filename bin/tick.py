@@ -378,11 +378,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
   }
 
+  // El <input type="datetime-local"> tiene resolución de minutos, así que al
+  // convertir unix → input perdemos los segundos. Expandimos `to` 59 s para no
+  // recortar la muestra final cuando el preset "Todo" se redondea hacia abajo.
   function filterSamples(from, to) {
-    return samplesAll.filter(s => s.ts >= from && s.ts <= to);
+    return samplesAll.filter(s => s.ts >= from && s.ts <= to + 59);
   }
   function filterTopApps(from, to) {
-    return topAppsAll.filter(t => t.ts >= from && t.ts <= to);
+    return topAppsAll.filter(t => t.ts >= from && t.ts <= to + 59);
   }
 
   function aggregate(arr, key) {
@@ -674,7 +677,7 @@ def render_html(conn) -> str:
     )
 
 
-def main():
+def tick_once():
     ts = int(time.time())
 
     sample = {"ram_total_mb": get_ram_total_mb()}
@@ -696,7 +699,31 @@ def main():
     finally:
         conn.close()
 
-    print(f"[mac-monitor] tick @ {datetime.fromtimestamp(ts).strftime('%H:%M:%S')} → {DASHBOARD_HTML}")
+    print(f"[mac-monitor] tick @ {datetime.fromtimestamp(ts).strftime('%H:%M:%S')} → {DASHBOARD_HTML}", flush=True)
+
+
+def main():
+    # Por defecto: una sola muestra (modo "now"). Con --daemon: loop continuo.
+    # macOS throttlea agresivamente los StartInterval cortos en jobs background,
+    # así que en modo agente preferimos un daemon de larga vida con KeepAlive.
+    daemon = "--daemon" in sys.argv
+    interval = 30
+    if "--interval" in sys.argv:
+        try:
+            interval = int(sys.argv[sys.argv.index("--interval") + 1])
+        except (ValueError, IndexError):
+            pass
+
+    if not daemon:
+        return tick_once()
+
+    while True:
+        try:
+            tick_once()
+        except Exception as exc:
+            # No matar el daemon por un tick fallido (ej. comando del sistema raro).
+            print(f"[mac-monitor] tick falló: {exc!r}", file=sys.stderr, flush=True)
+        time.sleep(interval)
 
 
 if __name__ == "__main__":

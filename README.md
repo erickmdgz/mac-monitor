@@ -117,6 +117,12 @@ Si editás `bin/tick.py`, basta con `./bin/mac-monitor on` (o `now`) para resinc
 
 `launchd` es el sistema nativo de macOS para tareas programadas, sobrevive a reinicios y maneja logs, intervalos y procesos huérfanos correctamente. El proyecto genera dinámicamente el `.plist` con paths absolutos al hacer `on`.
 
+### Por qué `tick.py` corre como daemon
+
+macOS Sequoia/Tahoe throttlea agresivamente los jobs de tipo `StartInterval` con intervalos cortos (< 60 s) — los deja en estado "pended speculative" y no los ejecuta. Por eso `tick.py` corre con la bandera `--daemon`: launchd lo lanza una sola vez con `KeepAlive: true`, y `tick.py` controla su propio loop con `time.sleep(interval)`. Si el proceso muere, `KeepAlive` lo respawnea. Esto evita el throttling y hace que el comportamiento sea idéntico en cualquier máquina.
+
+`mac-monitor on` hace además `launchctl kickstart` después del bootstrap para destrabar la primera ejecución (launchd a veces también posterga el `RunAtLoad`).
+
 ### Render estático
 
 El dashboard se regenera completo en cada tick — Python lee la DB, embebe los datos como JSON dentro del HTML, y escribe `dashboard.html`. El filtrado, downsampling y dibujo de los SVGs ocurren en el navegador con JavaScript vanilla. Sin servidor, sin red, sin CDNs.
@@ -125,16 +131,22 @@ El dashboard se regenera completo en cada tick — Python lee la DB, embebe los 
 
 ### Cambiar el intervalo de muestreo
 
-Editá `launchd/local.mac-monitor.plist.tpl`:
+El intervalo se pasa como argumento al daemon. Editá `launchd/local.mac-monitor.plist.tpl`:
 
 ```xml
-<key>StartInterval</key>
-<integer>30</integer>     <!-- segundos entre muestras -->
+<key>ProgramArguments</key>
+<array>
+    <string>/usr/bin/python3</string>
+    <string>__TICK_PY__</string>
+    <string>--daemon</string>
+    <string>--interval</string>
+    <string>30</string>            <!-- segundos entre muestras -->
+</array>
 ```
 
 Luego corré `./bin/mac-monitor on` para regenerar el plist y recargar.
 
-> **Nota:** intervalos muy cortos (< 30 s) van a generar muchas muestras por día. A 30 s son ~2880 muestras/día; a 5 min son ~288/día. La DB crece poco (cada muestra ocupa ~200 bytes), pero el dashboard se recalcula en cada tick.
+> **Nota:** A 30 s son ~2880 muestras/día; a 5 min son ~288/día. La DB crece poco (cada muestra ocupa ~200 bytes), pero el HTML del dashboard sí crece porque embebe todos los samples como JSON. Si pasa los ~5 MB, considerá un intervalo mayor o agregar un cap al embed.
 
 ### Cambiar el máximo de puntos del gráfico
 

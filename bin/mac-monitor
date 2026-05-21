@@ -69,9 +69,11 @@ cmd_on() {
     launchctl bootout "$USER_DOMAIN/$LABEL" 2>/dev/null || true
   fi
   launchctl bootstrap "$USER_DOMAIN" "$PLIST_DEST"
+  # Con KeepAlive + RunAtLoad, launchd todavía deja el job en "pended speculative".
+  # kickstart fuerza el primer spawn y a partir de ahí KeepAlive lo mantiene vivo.
+  launchctl kickstart "$USER_DOMAIN/$LABEL" >/dev/null 2>&1 || true
   echo "mac-monitor: ENCENDIDO."
-  echo "  Intervalo:    30 s"
-  echo "  Primer tick:  inmediato (RunAtLoad)"
+  echo "  Modo:         daemon (loop con sleep 30 s entre samples)"
   echo "  Runtime:      $RUNTIME_DIR"
   echo "  Dashboard:    $DASHBOARD"
   echo "  Apagar con:   $0 off"
