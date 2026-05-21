@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# mac-monitor — control de la recolección de métricas vía launchd.
+#
+# Estructura híbrida:
+#   - Código fuente (editable, versionable):  ~/Documents/personal/mac-monitor/
+#   - Runtime (datos + script ejecutado por launchd + dashboard + logs):
+#       ~/Library/Application Support/mac-monitor/
+#
+# Esto evita restricciones de TCC: launchd no puede leer archivos en ~/Documents/
+# salvo que se otorgue Full Disk Access manualmente al binario.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+TICK_SRC="$SCRIPT_DIR/tick.py"
+PLIST_TEMPLATE="$PROJECT_ROOT/launchd/local.mac-monitor.plist.tpl"
+
+RUNTIME_DIR="$HOME/Library/Application Support/mac-monitor"
+TICK_PY="$RUNTIME_DIR/tick.py"
+DASHBOARD="$RUNTIME_DIR/dashboard.html"
+LOG_OUT="$RUNTIME_DIR/stdout.log"
+LOG_ERR="$RUNTIME_DIR/stderr.log"
+
+LABEL="local.mac-monitor"
+PLIST_DEST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+USER_DOMAIN="gui/$(id -u)"
+
+LEGACY_LABEL="com.etegi.mac-monitor"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
+
+ensure_dirs() {
+  mkdir -p "$RUNTIME_DIR"
+  mkdir -p "$(dirname "$PLIST_DEST")"
+}
+
+sync_tick() {
+  ensure_dirs
+  cp "$TICK_SRC" "$TICK_PY"
+  chmod +x "$TICK_PY"
+}
+
+generate_plist() {
+  sync_tick
+  sed \
+    -e "s|__TICK_PY__|$TICK_PY|g" \
+    -e "s|__LOG_OUT__|$LOG_OUT|g" \
+    -e "s|__LOG_ERR__|$LOG_ERR|g" \
+    "$PLIST_TEMPLATE" > "$PLIST_DEST"
+}
+
+is_loaded() {
+  launchctl print "$USER_DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+cleanup_legacy() {
+  if [ -f "$LEGACY_PLIST" ]; then
+    launchctl bootout "$USER_DOMAIN/$LEGACY_LABEL" 2>/dev/null || true
+    rm -f "$LEGACY_PLIST"
+    echo "mac-monitor: migrado label '$LEGACY_LABEL' → '$LABEL'."
+  fi
+}
+
+cmd_on() {
+  cleanup_legacy
+  generate_plist
+  if is_loaded; then
+    echo "mac-monitor: ya estaba activo. Reinicio para aplicar plist actualizado."
+    launchctl bootout "$USER_DOMAIN/$LABEL" 2>/dev/null || true
+  fi
+  launchctl bootstrap "$USER_DOMAIN" "$PLIST_DEST"
+  echo "mac-monitor: ENCENDIDO."
+  echo "  Intervalo:    30 s"
+  echo "  Primer tick:  inmediato (RunAtLoad)"
+  echo "  Runtime:      $RUNTIME_DIR"
+  echo "  Dashboard:    $DASHBOARD"
+  echo "  Apagar con:   $0 off"
+}
+
+cmd_off() {
+  if is_loaded; then
+    launchctl bootout "$USER_DOMAIN/$LABEL"
+    echo "mac-monitor: APAGADO. Histórico preservado en $RUNTIME_DIR/metrics.db."
+  else
+    echo "mac-monitor: ya estaba apagado."
+  fi
+}
+
+cmd_status() {
+  if is_loaded; then
+    echo "mac-monitor: ACTIVO"
+    launchctl print "$USER_DOMAIN/$LABEL" 2>/dev/null | grep -E "state|last exit|run interval" | sed 's/^[[:space:]]*/  /'
+  else
+    echo "mac-monitor: inactivo"
+  fi
+  if [ -f "$DASHBOARD" ]; then
+    local mtime
+    mtime=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$DASHBOARD")
+    echo "  Última actualización del dashboard: $mtime"
+  fi
+}
+
+cmd_now() {
+  sync_tick
+  /usr/bin/python3 "$TICK_PY"
+}
+
+cmd_open() {
+  if [ ! -f "$DASHBOARD" ]; then
+    echo "mac-monitor: dashboard no existe todavía. Corré primero: $0 now"
+    exit 1
+  fi
+  open -a Safari "$DASHBOARD"
+}
+
+cmd_logs() {
+  echo "=== stderr ==="
+  [ -f "$LOG_ERR" ] && tail -30 "$LOG_ERR" || echo "(sin errores registrados)"
+  echo
+  echo "=== stdout ==="
+  [ -f "$LOG_OUT" ] && tail -10 "$LOG_OUT" || echo "(vacío)"
+}
+
+usage() {
+  cat <<EOF
+mac-monitor — recolección manual de métricas de macOS
+
+Uso: $0 <comando>
+
+Comandos:
+  on       Activa recolección automática cada 30 s (launchd)
+  off      Apaga la recolección. Conserva la DB.
+  status   Muestra si está activo y última actualización del dashboard
+  now      Recolecta una muestra ahora (manual, no requiere estar 'on')
+  open     Abre dashboard.html en Safari
+  logs     Muestra los últimos logs de stdout/stderr
+  help     Esta ayuda
+
+Archivos:
+  Código fuente:    $PROJECT_ROOT/
+  Runtime:          $RUNTIME_DIR/
+    - metrics.db     (histórico)
+    - dashboard.html (UI)
+    - tick.py        (copia ejecutada por launchd)
+    - stdout.log / stderr.log
+  Launchd plist:    $PLIST_DEST
+EOF
+}
+
+case "${1:-help}" in
+  on)            cmd_on ;;
+  off)           cmd_off ;;
+  status)        cmd_status ;;
+  now)           cmd_now ;;
+  open)          cmd_open ;;
+  logs)          cmd_logs ;;
+  help|--help|-h) usage ;;
+  *)
+    echo "Comando desconocido: ${1:-}"
+    echo
+    usage
+    exit 1
+    ;;
+esac

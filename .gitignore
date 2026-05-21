@@ -1,0 +1,64 @@
+# Entornos y secretos
+.env
+.env.*
+.secrets/
+*credentials*
+*secret*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Node / JS
+node_modules/
+dist/
+build/
+.next/
+.turbo/
+.cache/
+coverage/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Rust
+target/
+
+# Go
+bin/
+*.test
+*.out
+
+# IDEs (descomenta selectivamente si aplica)
+# .idea/
+# .vscode/
+*.swp
+*.swo
+
+# Temporales
+tmp/
+temp/
+
+# mac-monitor: runtime vive en ~/Library/Application Support/mac-monitor/.
+# Los scripts en bin/ SÍ deben versionarse (la regla bin/ de Go aplicaba a artefactos Go).
+!bin/
+
+# Por si alguna vez se genera algo suelto en la raíz:
+data/
+dashboard.html
+
+# Claude Code (config local del usuario)
+.claude/
