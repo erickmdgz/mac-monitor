@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Recolecta métricas de macOS, las guarda en SQLite y regenera dashboard.html."""
 
+import json
 import re
 import sqlite3
 import subprocess
@@ -227,103 +228,14 @@ def fetch_all(conn):
     return [dict(zip(cols, r)) for r in rows]
 
 
-NUMERIC_KEYS = [k for k in SAMPLE_COLS if k != "ts"]
-
-
-def downsample(samples, max_points=800):
-    n = len(samples)
-    if n <= max_points:
-        return samples
-    bucket_size = n / max_points
-    out = []
-    for i in range(max_points):
-        start = int(i * bucket_size)
-        end = int((i + 1) * bucket_size)
-        if end <= start:
-            end = start + 1
-        bucket = samples[start:end]
-        if not bucket:
-            continue
-        agg = {"ts": int(sum(s["ts"] for s in bucket) / len(bucket))}
-        for k in NUMERIC_KEYS:
-            vals = [s[k] for s in bucket if s.get(k) is not None]
-            agg[k] = (sum(vals) / len(vals)) if vals else None
-        out.append(agg)
-    return out
-
-
-def fetch_top_apps_now(conn):
-    latest = conn.execute("SELECT MAX(ts) FROM samples").fetchone()[0]
-    if latest is None:
-        return []
-    return conn.execute(
-        "SELECT app, rss_mb, num_procs FROM top_apps WHERE ts = ? ORDER BY rank",
-        (latest,),
+def fetch_top_apps_all(conn):
+    rows = conn.execute(
+        "SELECT ts, app, rss_mb, num_procs FROM top_apps ORDER BY ts, rank"
     ).fetchall()
+    return [{"ts": ts, "app": app, "rss_mb": rss, "num_procs": n} for ts, app, rss, n in rows]
 
 
-def svg_line(samples, key, label, color, height=180, width=720):
-    if len(samples) < 2:
-        return (
-            f'<svg viewBox="0 0 {width} {height}" width="100%" '
-            f'style="max-width:{width}px;display:block">'
-            f'<text x="50%" y="50%" fill="#888" text-anchor="middle" '
-            f'font-family="system-ui" font-size="13">{label}: datos insuficientes</text></svg>'
-        )
-
-    pad_l, pad_r, pad_t, pad_b = 50, 14, 22, 22
-    chart_w = width - pad_l - pad_r
-    chart_h = height - pad_t - pad_b
-
-    values = [(s[key] if s.get(key) is not None else 0.0) for s in samples]
-    ts_list = [s["ts"] for s in samples]
-
-    v_min, v_max = min(values), max(values)
-    if v_max == v_min:
-        v_max = v_min + 1
-    t_min, t_max = ts_list[0], ts_list[-1]
-    if t_max == t_min:
-        t_max = t_min + 1
-
-    def xp(ts):
-        return pad_l + (ts - t_min) / (t_max - t_min) * chart_w
-
-    def yp(v):
-        return pad_t + (1 - (v - v_min) / (v_max - v_min)) * chart_h
-
-    pts = " ".join(f"{xp(t):.1f},{yp(v):.1f}" for t, v in zip(ts_list, values))
-
-    ticks_svg = []
-    for i in range(4):
-        v = v_min + (v_max - v_min) * (i / 3)
-        y = yp(v)
-        ticks_svg.append(
-            f'<line x1="{pad_l}" x2="{width - pad_r}" y1="{y:.1f}" y2="{y:.1f}" '
-            f'stroke="currentColor" stroke-opacity="0.08" stroke-width="1"/>'
-            f'<text x="{pad_l - 6}" y="{y + 4:.1f}" fill="currentColor" fill-opacity="0.55" '
-            f'text-anchor="end" font-size="10" font-family="system-ui">{v:.0f}</text>'
-        )
-
-    span = t_max - t_min
-    if span < 24 * 3600:
-        fmt = "%H:%M"
-    elif span < 7 * 24 * 3600:
-        fmt = "%d %b %H:%M"
-    else:
-        fmt = "%Y-%m-%d"
-    t0 = datetime.fromtimestamp(t_min).strftime(fmt)
-    t1 = datetime.fromtimestamp(t_max).strftime(fmt)
-
-    return f"""<svg viewBox="0 0 {width} {height}" width="100%" style="max-width:{width}px;height:auto;display:block">
-  <text x="{pad_l}" y="14" fill="currentColor" font-size="12" font-family="system-ui" font-weight="600">{label}</text>
-  <text x="{width - pad_r}" y="14" fill="{color}" font-size="12" font-family="system-ui" text-anchor="end" font-variant-numeric="tabular-nums">{values[-1]:.1f}</text>
-  {"".join(ticks_svg)}
-  <polyline fill="none" stroke="{color}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" points="{pts}"/>
-  <text x="{pad_l}" y="{height - 6}" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui">{t0}</text>
-  <text x="{width - pad_r}" y="{height - 6}" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui" text-anchor="end">{t1}</text>
-</svg>"""
-
-
+# TODO: si el HTML crece >5 MB (≈30 días @30s), cap'ear el embed a últimos N días.
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -341,6 +253,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   h1 { font-size:26px; margin:0 0 4px; letter-spacing:-0.02em; }
   .subtitle { color:var(--muted); font-size:13px; margin-bottom:24px; }
   h2 { font-size:17px; margin:36px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--border); letter-spacing:-0.01em; }
+
+  .filters {
+    display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+    margin:14px 0 0; padding:14px;
+    background:var(--card); border:1px solid var(--border); border-radius:10px;
+  }
+  .filters label { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  .filters input[type="datetime-local"] {
+    background:var(--card-2); color:var(--text);
+    border:1px solid var(--border); border-radius:6px;
+    padding:6px 8px; font-size:13px; font-family:inherit;
+  }
+  .presets { display:flex; gap:6px; flex-wrap:wrap; }
+  .preset, .toggle {
+    background:var(--card-2); color:var(--text);
+    border:1px solid var(--border); border-radius:6px;
+    padding:6px 10px; font-size:12px; font-family:inherit; cursor:pointer;
+  }
+  .preset:hover, .toggle:hover { border-color:var(--accent); }
+  .preset.active { background:var(--accent); color:white; border-color:var(--accent); }
+  .toggle.on::before { content:"●"; color:#9ece6a; margin-right:6px; }
+  .toggle.off::before { content:"●"; color:var(--muted); margin-right:6px; }
+  .spacer { flex:1; }
+
+  #range-info { color:var(--muted); font-size:13px; margin:14px 0 18px; }
+
   .stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; }
   .stat { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
   .stat .label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; }
@@ -360,21 +298,354 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>mac-monitor</h1>
-  <div class="subtitle">Última muestra: __NOW__ · Rango: __RANGE__ · Muestras: __NSAMPLES__ (mostradas: __NPLOT__)</div>
+  <div class="subtitle">Última muestra: __NOW__ · Histórico: __NTOTAL__ muestras desde __TMIN__</div>
 
-  <div class="stat-grid">__STATS__</div>
+  <div class="filters">
+    <label>Desde <input type="datetime-local" id="from"></label>
+    <label>Hasta <input type="datetime-local" id="to"></label>
+    <div class="presets">
+      <button class="preset" data-preset="1h">1h</button>
+      <button class="preset" data-preset="6h">6h</button>
+      <button class="preset" data-preset="24h">24h</button>
+      <button class="preset" data-preset="7d">7d</button>
+      <button class="preset" data-preset="all">Todo</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="toggle on" id="auto-refresh">Auto-refresh: ON</button>
+  </div>
 
-  <h2>Tendencias (histórico completo)</h2>
-  <div class="charts">__CHARTS__</div>
+  <div id="range-info"></div>
 
-  <h2>Top apps por RAM (snapshot actual)</h2>
+  <div class="stat-grid" id="stats"></div>
+
+  <h2>Tendencias</h2>
+  <div class="charts" id="charts"></div>
+
+  <h2 id="top-title">Top apps por RAM (promedio en ventana)</h2>
   <table>
-    <thead><tr><th>App</th><th class="num">RAM</th><th class="num">Procesos</th></tr></thead>
-    <tbody>__ROWS__</tbody>
+    <thead><tr><th>App</th><th class="num">RAM (prom.)</th><th class="num">Procesos (prom.)</th></tr></thead>
+    <tbody id="top-apps"></tbody>
   </table>
 
   <footer>Control: <code>./bin/mac-monitor on|off|now|open</code>.</footer>
 </div>
+
+<script id="data" type="application/json">__DATA_JSON__</script>
+<script>
+(function () {
+  const DATA = JSON.parse(document.getElementById('data').textContent);
+  const samplesAll = DATA.samples;
+  const topAppsAll = DATA.topApps;
+
+  const container = document.querySelector('.container');
+  if (!samplesAll.length) {
+    container.innerHTML = '<h1>mac-monitor</h1><p>No hay datos todavía. Corré <code>./bin/mac-monitor now</code>.</p>';
+    return;
+  }
+
+  const fromInput = document.getElementById('from');
+  const toInput = document.getElementById('to');
+  const presetButtons = document.querySelectorAll('.preset');
+  const autoBtn = document.getElementById('auto-refresh');
+
+  const FIRST_TS = samplesAll[0].ts;
+  const LAST_TS = samplesAll[samplesAll.length - 1].ts;
+
+  const STORAGE_RANGE = 'mac-monitor:range';
+  const STORAGE_AUTO = 'mac-monitor:autorefresh';
+
+  function pad(n) { return String(n).padStart(2, '0'); }
+  function unixToLocalInput(unix) {
+    const d = new Date(unix * 1000);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+         + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+  function inputToUnix(value) {
+    if (!value) return null;
+    const t = new Date(value).getTime();
+    if (isNaN(t)) return null;
+    return Math.floor(t / 1000);
+  }
+  function fmtTs(unix, span) {
+    const d = new Date(unix * 1000);
+    if (span < 24 * 3600) {
+      return pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+    if (span < 7 * 24 * 3600) {
+      const months = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+      return pad(d.getDate()) + ' ' + months[d.getMonth()] + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+
+  function filterSamples(from, to) {
+    return samplesAll.filter(s => s.ts >= from && s.ts <= to);
+  }
+  function filterTopApps(from, to) {
+    return topAppsAll.filter(t => t.ts >= from && t.ts <= to);
+  }
+
+  function aggregate(arr, key) {
+    let min = Infinity, max = -Infinity, sum = 0, n = 0, last = null;
+    for (const x of arr) {
+      const v = x[key];
+      if (v == null) continue;
+      if (v < min) min = v;
+      if (v > max) max = v;
+      sum += v; n++; last = v;
+    }
+    if (!n) return null;
+    return { min, max, avg: sum / n, last };
+  }
+
+  function downsample(arr, maxPoints) {
+    const n = arr.length;
+    if (n <= maxPoints) return arr;
+    const bucket = n / maxPoints;
+    const numKeys = Object.keys(arr[0]).filter(k => k !== 'ts');
+    const out = [];
+    for (let i = 0; i < maxPoints; i++) {
+      const a = Math.floor(i * bucket);
+      let b = Math.floor((i + 1) * bucket);
+      if (b <= a) b = a + 1;
+      const slice = arr.slice(a, b);
+      if (!slice.length) continue;
+      const agg = { ts: Math.floor(slice.reduce((s, x) => s + x.ts, 0) / slice.length) };
+      for (const k of numKeys) {
+        let s = 0, c = 0;
+        for (const x of slice) { if (x[k] != null) { s += x[k]; c++; } }
+        agg[k] = c ? s / c : null;
+      }
+      out.push(agg);
+    }
+    return out;
+  }
+
+  function svgLine(samples, key, label, color) {
+    const W = 720, H = 180, padL = 50, padR = 14, padT = 22, padB = 22;
+    const chartW = W - padL - padR, chartH = H - padT - padB;
+    if (samples.length < 2) {
+      return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="max-width:' + W + 'px;display:block">'
+           + '<text x="50%" y="50%" fill="#888" text-anchor="middle" font-family="system-ui" font-size="13">'
+           + label + ': datos insuficientes</text></svg>';
+    }
+    const values = samples.map(s => s[key] == null ? 0 : s[key]);
+    const ts = samples.map(s => s.ts);
+    let vmin = Math.min.apply(null, values), vmax = Math.max.apply(null, values);
+    if (vmax === vmin) vmax = vmin + 1;
+    let tmin = ts[0], tmax = ts[ts.length - 1];
+    if (tmax === tmin) tmax = tmin + 1;
+    const xp = t => padL + (t - tmin) / (tmax - tmin) * chartW;
+    const yp = v => padT + (1 - (v - vmin) / (vmax - vmin)) * chartH;
+    const pts = ts.map((t, i) => xp(t).toFixed(1) + ',' + yp(values[i]).toFixed(1)).join(' ');
+
+    let ticks = '';
+    for (let i = 0; i < 4; i++) {
+      const v = vmin + (vmax - vmin) * (i / 3);
+      const y = yp(v);
+      ticks += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y.toFixed(1) + '" y2="' + y.toFixed(1)
+            + '" stroke="currentColor" stroke-opacity="0.08" stroke-width="1"/>'
+            + '<text x="' + (padL - 6) + '" y="' + (y + 4).toFixed(1)
+            + '" fill="currentColor" fill-opacity="0.55" text-anchor="end" font-size="10" font-family="system-ui">'
+            + v.toFixed(0) + '</text>';
+    }
+    const span = tmax - tmin;
+    const t0 = fmtTs(tmin, span), t1 = fmtTs(tmax, span);
+
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="max-width:' + W + 'px;height:auto;display:block">'
+         + '<text x="' + padL + '" y="14" fill="currentColor" font-size="12" font-family="system-ui" font-weight="600">' + label + '</text>'
+         + '<text x="' + (W - padR) + '" y="14" fill="' + color + '" font-size="12" font-family="system-ui" text-anchor="end" font-variant-numeric="tabular-nums">'
+         + values[values.length - 1].toFixed(1) + '</text>'
+         + ticks
+         + '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>'
+         + '<text x="' + padL + '" y="' + (H - 6) + '" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui">' + t0 + '</text>'
+         + '<text x="' + (W - padR) + '" y="' + (H - 6) + '" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui" text-anchor="end">' + t1 + '</text>'
+         + '</svg>';
+  }
+
+  function fmt(n, digits) {
+    if (n == null || isNaN(n)) return '—';
+    return digits === undefined ? n.toFixed(0) : n.toFixed(digits);
+  }
+
+  function renderStats(samples) {
+    const latest = samples[samples.length - 1];
+    const ramUsed = (latest.ram_total_mb || 0) - (latest.ram_free_mb || 0);
+    const ramPct = latest.ram_total_mb ? (ramUsed / latest.ram_total_mb * 100) : 0;
+    const cpuSamples = samples.map(s => ({ cpu_used: s.cpu_idle == null ? null : 100 - s.cpu_idle }));
+    const cpuAgg = aggregate(cpuSamples, 'cpu_used');
+    const ramFreeAgg = aggregate(samples, 'ram_free_mb');
+    const loadAgg = aggregate(samples, 'load_1');
+    const cpuLast = latest.cpu_idle == null ? null : 100 - latest.cpu_idle;
+
+    const cards = [];
+    cards.push('<div class="stat"><div class="label">RAM total</div><div class="value">' + fmt(latest.ram_total_mb / 1024) + ' GB</div></div>');
+    cards.push('<div class="stat"><div class="label">RAM en uso (final)</div><div class="value">' + fmt(ramUsed / 1024, 1) + ' GB</div><div class="muted">' + fmt(ramPct) + '%</div></div>');
+    cards.push('<div class="stat"><div class="label">RAM libre</div><div class="value">' + fmt(latest.ram_free_mb) + ' MB</div><div class="muted">min ' + (ramFreeAgg ? fmt(ramFreeAgg.min) : '—') + ' · prom ' + (ramFreeAgg ? fmt(ramFreeAgg.avg) : '—') + '</div></div>');
+    cards.push('<div class="stat"><div class="label">Comprimido</div><div class="value">' + fmt(latest.ram_compressed_mb) + ' MB</div></div>');
+    cards.push('<div class="stat"><div class="label">CPU usado</div><div class="value">' + fmt(cpuLast) + '%</div><div class="muted">prom ' + (cpuAgg ? fmt(cpuAgg.avg) : '—') + ' · máx ' + (cpuAgg ? fmt(cpuAgg.max) : '—') + '</div></div>');
+    cards.push('<div class="stat"><div class="label">Load 1m</div><div class="value">' + fmt(latest.load_1, 2) + '</div><div class="muted">prom ' + (loadAgg ? fmt(loadAgg.avg, 2) : '—') + ' · máx ' + (loadAgg ? fmt(loadAgg.max, 2) : '—') + '</div></div>');
+    cards.push('<div class="stat"><div class="label">Disco /</div><div class="value">' + fmt(latest.disk_pct) + '%</div><div class="muted">' + fmt(latest.disk_used_gb) + ' / ' + fmt(latest.disk_total_gb) + ' GB</div></div>');
+    if (latest.battery_pct != null) {
+      const ch = latest.battery_charging ? 'cargando' : 'batería';
+      cards.push('<div class="stat"><div class="label">Batería</div><div class="value">' + latest.battery_pct + '%</div><div class="muted">' + ch + '</div></div>');
+    }
+    document.getElementById('stats').innerHTML = cards.join('');
+  }
+
+  function renderCharts(samples) {
+    const enriched = samples.map(s => Object.assign({}, s, { cpu_used: s.cpu_idle == null ? null : 100 - s.cpu_idle }));
+    const ds = downsample(enriched, 800);
+    document.getElementById('charts').innerHTML = [
+      '<div class="chart-card">' + svgLine(ds, 'ram_free_mb', 'RAM libre (MB)', '#7aa2f7') + '</div>',
+      '<div class="chart-card">' + svgLine(ds, 'ram_compressed_mb', 'Compresor (MB)', '#e0af68') + '</div>',
+      '<div class="chart-card">' + svgLine(ds, 'cpu_used', 'CPU usado (%)', '#f7768e') + '</div>',
+      '<div class="chart-card">' + svgLine(ds, 'load_1', 'Load avg (1 min)', '#9ece6a') + '</div>',
+    ].join('');
+  }
+
+  function renderTopApps(rows) {
+    const groups = {};
+    for (const r of rows) {
+      if (!groups[r.app]) groups[r.app] = { rss: 0, np: 0, n: 0 };
+      groups[r.app].rss += r.rss_mb;
+      groups[r.app].np += r.num_procs;
+      groups[r.app].n++;
+    }
+    const list = Object.keys(groups).map(app => ({
+      app,
+      rss: groups[app].rss / groups[app].n,
+      np: groups[app].np / groups[app].n,
+    })).sort((a, b) => b.rss - a.rss).slice(0, 10);
+
+    const tbody = document.getElementById('top-apps');
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:var(--muted)">sin datos en la ventana</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.map(r =>
+      '<tr><td>' + r.app + '</td><td class="num">' + fmt(r.rss) + ' MB</td><td class="num">' + fmt(r.np, 1) + '</td></tr>'
+    ).join('');
+  }
+
+  function renderRangeInfo(samples) {
+    const el = document.getElementById('range-info');
+    if (!samples.length) {
+      el.textContent = 'Sin muestras en la ventana seleccionada.';
+      return;
+    }
+    const span = samples[samples.length - 1].ts - samples[0].ts;
+    const word = samples.length === 1 ? 'muestra' : 'muestras';
+    el.textContent = 'Mostrando ' + samples.length + ' ' + word
+      + ' · ' + fmtTs(samples[0].ts, span) + ' → ' + fmtTs(samples[samples.length - 1].ts, span);
+  }
+
+  function apply(saveToStorage) {
+    const from = inputToUnix(fromInput.value);
+    const to = inputToUnix(toInput.value);
+    if (from == null || to == null || to < from) return;
+
+    const samples = filterSamples(from, to);
+    const tops = filterTopApps(from, to);
+    renderRangeInfo(samples);
+
+    if (!samples.length) {
+      document.getElementById('stats').innerHTML = '';
+      document.getElementById('charts').innerHTML = '';
+      renderTopApps([]);
+    } else {
+      renderStats(samples);
+      renderCharts(samples);
+      renderTopApps(tops);
+    }
+
+    if (saveToStorage !== false) {
+      try {
+        const activePreset = document.querySelector('.preset.active');
+        localStorage.setItem(STORAGE_RANGE, JSON.stringify({
+          from: fromInput.value,
+          to: toInput.value,
+          preset: activePreset ? activePreset.dataset.preset : null,
+        }));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  const PRESET_SPANS = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 };
+
+  function applyPreset(preset, persist) {
+    presetButtons.forEach(b => b.classList.remove('active'));
+    const btn = document.querySelector('.preset[data-preset="' + preset + '"]');
+    if (btn) btn.classList.add('active');
+    let from;
+    if (preset === 'all') {
+      from = FIRST_TS;
+    } else {
+      const span = PRESET_SPANS[preset] || 86400;
+      from = Math.max(FIRST_TS, LAST_TS - span);
+    }
+    fromInput.value = unixToLocalInput(from);
+    toInput.value = unixToLocalInput(LAST_TS);
+    apply(persist !== false);
+  }
+
+  function clearPresetActive() {
+    presetButtons.forEach(b => b.classList.remove('active'));
+  }
+
+  fromInput.addEventListener('change', () => { clearPresetActive(); apply(true); });
+  toInput.addEventListener('change', () => { clearPresetActive(); apply(true); });
+  presetButtons.forEach(btn => btn.addEventListener('click', () => applyPreset(btn.dataset.preset, true)));
+
+  // Auto-refresh
+  let refreshTimer = null;
+  function setAutoRefresh(on) {
+    if (on) {
+      autoBtn.classList.add('on'); autoBtn.classList.remove('off');
+      autoBtn.textContent = 'Auto-refresh: ON';
+      if (!refreshTimer) {
+        refreshTimer = setInterval(() => {
+          if (document.visibilityState === 'visible') location.reload();
+        }, 30000);
+      }
+    } else {
+      autoBtn.classList.add('off'); autoBtn.classList.remove('on');
+      autoBtn.textContent = 'Auto-refresh: OFF';
+      if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+    }
+    try { localStorage.setItem(STORAGE_AUTO, on ? 'on' : 'off'); } catch (e) {}
+  }
+  autoBtn.addEventListener('click', () => setAutoRefresh(!autoBtn.classList.contains('on')));
+
+  // Restaurar estado desde localStorage
+  let restored = false;
+  try {
+    const saved = localStorage.getItem(STORAGE_RANGE);
+    if (saved) {
+      const r = JSON.parse(saved);
+      if (r.preset && PRESET_SPANS[r.preset] !== undefined || r.preset === 'all') {
+        applyPreset(r.preset, false);
+        restored = true;
+      } else if (r.from && r.to) {
+        fromInput.value = r.from;
+        toInput.value = r.to;
+        apply(false);
+        restored = true;
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  if (!restored) {
+    const span = LAST_TS - FIRST_TS;
+    applyPreset(span <= 86400 ? 'all' : '24h', false);
+  }
+
+  try {
+    const auto = localStorage.getItem(STORAGE_AUTO);
+    setAutoRefresh(auto !== 'off');
+  } catch (e) { setAutoRefresh(true); }
+})();
+</script>
 </body>
 </html>"""
 
@@ -387,59 +658,19 @@ def render_html(conn) -> str:
         body = '<div class="container"><h1>mac-monitor</h1><p>No hay datos todavía. Corré <code>./bin/mac-monitor now</code>.</p></div>'
         return f"<!DOCTYPE html><html><head><meta charset='UTF-8'><title>mac-monitor</title></head><body>{body}</body></html>"
 
-    latest = all_samples[-1]
-    samples = downsample(all_samples, max_points=800)
-    for s in samples:
-        s["cpu_used"] = 100.0 - (s.get("cpu_idle") or 0.0)
-
+    top_apps = fetch_top_apps_all(conn)
     t_min = all_samples[0]["ts"]
-    t_max = all_samples[-1]["ts"]
-    span = t_max - t_min
-    if span < 24 * 3600:
-        range_fmt = "%H:%M"
-    elif span < 7 * 24 * 3600:
-        range_fmt = "%d %b %H:%M"
-    else:
-        range_fmt = "%Y-%m-%d %H:%M"
-    range_str = f"{datetime.fromtimestamp(t_min).strftime(range_fmt)} → {datetime.fromtimestamp(t_max).strftime(range_fmt)}"
+    t_min_str = datetime.fromtimestamp(t_min).strftime("%Y-%m-%d %H:%M")
 
-    ram_used = (latest["ram_total_mb"] or 0) - (latest["ram_free_mb"] or 0)
-    ram_pct = (ram_used / latest["ram_total_mb"] * 100) if latest["ram_total_mb"] else 0
-
-    stats = []
-    stats.append(f'<div class="stat"><div class="label">RAM total</div><div class="value">{latest["ram_total_mb"]/1024:.0f} GB</div></div>')
-    stats.append(f'<div class="stat"><div class="label">RAM en uso</div><div class="value">{ram_used/1024:.1f} GB</div><div class="muted">{ram_pct:.0f}%</div></div>')
-    stats.append(f'<div class="stat"><div class="label">RAM libre</div><div class="value">{latest["ram_free_mb"]:.0f} MB</div></div>')
-    stats.append(f'<div class="stat"><div class="label">Comprimido</div><div class="value">{latest["ram_compressed_mb"]:.0f} MB</div></div>')
-    stats.append(f'<div class="stat"><div class="label">CPU usado</div><div class="value">{100-latest["cpu_idle"]:.0f}%</div><div class="muted">u {latest["cpu_user"]:.0f} · s {latest["cpu_sys"]:.0f}</div></div>')
-    stats.append(f'<div class="stat"><div class="label">Load 1m</div><div class="value">{latest["load_1"]:.2f}</div><div class="muted">5m {latest["load_5"]:.2f} · 15m {latest["load_15"]:.2f}</div></div>')
-    stats.append(f'<div class="stat"><div class="label">Disco /</div><div class="value">{latest["disk_pct"]:.0f}%</div><div class="muted">{latest["disk_used_gb"]:.0f} / {latest["disk_total_gb"]:.0f} GB</div></div>')
-    if latest["battery_pct"] is not None:
-        ch = "cargando" if latest["battery_charging"] else "batería"
-        stats.append(f'<div class="stat"><div class="label">Batería</div><div class="value">{latest["battery_pct"]}%</div><div class="muted">{ch}</div></div>')
-
-    charts = "".join([
-        '<div class="chart-card">' + svg_line(samples, "ram_free_mb", "RAM libre (MB)", "#7aa2f7") + '</div>',
-        '<div class="chart-card">' + svg_line(samples, "ram_compressed_mb", "Compresor (MB)", "#e0af68") + '</div>',
-        '<div class="chart-card">' + svg_line(samples, "cpu_used", "CPU usado (%)", "#f7768e") + '</div>',
-        '<div class="chart-card">' + svg_line(samples, "load_1", "Load avg (1 min)", "#9ece6a") + '</div>',
-    ])
-
-    top_apps = fetch_top_apps_now(conn)
-    rows = "".join(
-        f'<tr><td>{app}</td><td class="num">{rss:.0f} MB</td><td class="num">{n}</td></tr>'
-        for app, rss, n in top_apps
-    )
+    payload = {"samples": all_samples, "topApps": top_apps}
+    data_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
 
     return (
         HTML_TEMPLATE
         .replace("__NOW__", now)
-        .replace("__RANGE__", range_str)
-        .replace("__NSAMPLES__", str(len(all_samples)))
-        .replace("__NPLOT__", str(len(samples)))
-        .replace("__STATS__", "".join(stats))
-        .replace("__CHARTS__", charts)
-        .replace("__ROWS__", rows or '<tr><td colspan="3" style="text-align:center;color:var(--muted)">sin datos</td></tr>')
+        .replace("__NTOTAL__", str(len(all_samples)))
+        .replace("__TMIN__", t_min_str)
+        .replace("__DATA_JSON__", data_json)
     )
 
 

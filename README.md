@@ -4,8 +4,8 @@ Recolector ligero de métricas de macOS (RAM, CPU, disco, batería, top apps por
 
 - **Cero dependencias externas.** Solo Python 3 (incluido en macOS) y herramientas nativas (`vm_stat`, `ps`, `sysctl`, `df`, `pmset`, `top`).
 - **Control manual.** Se enciende y se apaga con un comando — vos decidís cuándo medir.
-- **Histórico completo.** El dashboard muestra todo el rango de muestras recolectadas, con downsampling automático si hay muchas.
-- **Sin servidor, sin JS frameworks.** El dashboard es HTML + SVG inline, se abre con `file://`.
+- **Dashboard interactivo.** Selector de fecha/hora (desde/hasta) + presets (1h, 6h, 24h, 7d, Todo), agregados (min/máx/promedio) por ventana y top apps recalculadas según el rango. Auto-refresh cada 30 s opcional.
+- **Sin servidor, sin frameworks.** El dashboard es un único HTML autocontenido (HTML + SVG + ~150 líneas de JS vanilla), se abre con `file://`.
 
 ## Captura rápida
 
@@ -77,6 +77,24 @@ Y el agente de `launchd`:
 
 `metrics.db` **es persistente**: se conserva al hacer `off`, al reiniciar el Mac, al cerrar sesión. Solo se borra si vos lo borrás manualmente.
 
+## El dashboard
+
+El dashboard es un único archivo `dashboard.html` autocontenido. Toda la lógica de filtrado, agregación y dibujo de gráficos vive en ~150 líneas de JavaScript embebidas. Los datos se embeben como JSON dentro del propio HTML, así que se abre con `file://` sin necesidad de servidor.
+
+### Selección de ventana
+
+- Dos inputs `datetime-local` (**Desde** / **Hasta**) para definir un rango arbitrario.
+- Botones preset: `1h`, `6h`, `24h`, `7d`, `Todo`.
+- Cambiar manualmente cualquiera de los inputs aplica el filtro al instante y desactiva el preset.
+
+### Agregados y top apps por ventana
+
+Las tarjetas muestran el valor final de la ventana seleccionada más `min · prom` o `prom · máx` según la métrica. La tabla **Top apps** agrupa por aplicación todas las muestras dentro de la ventana, promedia su uso de RAM y número de procesos, y ordena por RAM descendente.
+
+### Auto-refresh
+
+Como el archivo se regenera en disco cada 30 s mientras el agente está `on`, el dashboard recarga la pestaña automáticamente al mismo intervalo. El estado (rango seleccionado + on/off del auto-refresh) se persiste en `localStorage`, así que la recarga conserva la vista. El botón **Auto-refresh: ON / OFF** permite desactivarlo. La recarga se pausa cuando la pestaña no está visible.
+
 ## Cómo funciona
 
 ### Estructura híbrida (código vs runtime)
@@ -101,7 +119,7 @@ Si editás `bin/tick.py`, basta con `./bin/mac-monitor on` (o `now`) para resinc
 
 ### Render estático
 
-El dashboard se regenera completo en cada tick — Python lee la DB, hace downsampling si hay más de 800 muestras, y escribe `dashboard.html` con SVG inline. Sin servidor, sin red, sin CDNs.
+El dashboard se regenera completo en cada tick — Python lee la DB, embebe los datos como JSON dentro del HTML, y escribe `dashboard.html`. El filtrado, downsampling y dibujo de los SVGs ocurren en el navegador con JavaScript vanilla. Sin servidor, sin red, sin CDNs.
 
 ## Personalización
 
@@ -120,7 +138,7 @@ Luego corré `./bin/mac-monitor on` para regenerar el plist y recargar.
 
 ### Cambiar el máximo de puntos del gráfico
 
-En `bin/tick.py`, función `downsample()` — por defecto `max_points=800`. Bajalo si querés gráficos más livianos, subilo si querés más resolución.
+El downsampling vive en el JS embebido del dashboard (función `downsample()` dentro del bloque `<script>` de `HTML_TEMPLATE` en `bin/tick.py`). Por defecto `maxPoints=800`. Bajalo si querés gráficos más livianos, subilo si querés más resolución.
 
 ### Agregar/quitar apps en el clasificador
 
