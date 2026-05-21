@@ -155,3 +155,7 @@ rm -rf <ruta-al-clon>
 ## Contribuciones
 
 Issues y PRs bienvenidos. El proyecto está intencionalmente acotado — su valor es ser pequeño, leíble y sin dependencias.
+
+## Licencia
+
+[MIT](./LICENSE) © 2026 erickmdgz
