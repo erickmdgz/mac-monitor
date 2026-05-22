@@ -285,7 +285,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .stat .value { font-size:22px; font-weight:600; margin-top:4px; font-variant-numeric:tabular-nums; }
   .stat .muted { font-size:12px; color:var(--muted); margin-top:2px; }
   .charts { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
-  .chart-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; color:var(--text); }
+  .chart-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:12px 14px; color:var(--text); position:relative; }
+  .chart-card svg { cursor:crosshair; }
+  .chart-tooltip {
+    position:absolute; pointer-events:none;
+    background:var(--card-2); color:var(--text);
+    border:1px solid var(--border); border-radius:6px;
+    padding:6px 8px; font-size:12px; font-variant-numeric:tabular-nums;
+    white-space:nowrap; opacity:0; transition:opacity 80ms;
+    box-shadow:0 4px 12px rgba(0,0,0,0.18);
+    z-index:2;
+  }
+  .chart-tooltip.show { opacity:1; }
+  .chart-tooltip .ts { color:var(--muted); font-size:11px; margin-bottom:2px; }
   @media (max-width:780px) { .charts { grid-template-columns:1fr; } }
   table { width:100%; border-collapse:collapse; margin-top:4px; font-size:14px; }
   th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--border); }
@@ -424,45 +436,62 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     return out;
   }
 
-  function svgLine(samples, key, label, color) {
-    const W = 720, H = 180, padL = 50, padR = 14, padT = 22, padB = 22;
-    const chartW = W - padL - padR, chartH = H - padT - padB;
+  const SVG_W = 720, SVG_H = 180, PADL = 50, PADR = 14, PADT = 22, PADB = 22;
+  const CHARTW = SVG_W - PADL - PADR, CHARTH = SVG_H - PADT - PADB;
+
+  const CHART_DEFS = [
+    { key: 'ram_free_mb',       label: 'RAM libre (MB)',   color: '#7aa2f7', digits: 1 },
+    { key: 'ram_compressed_mb', label: 'Compresor (MB)',   color: '#e0af68', digits: 1 },
+    { key: 'cpu_used',          label: 'CPU usado (%)',    color: '#f7768e', digits: 1 },
+    { key: 'load_1',            label: 'Load avg (1 min)', color: '#9ece6a', digits: 2 },
+  ];
+
+  // Estado del render actual: usado por el hover-tooltip para encontrar el
+  // sample más cercano sin tener que volver a downsamplear.
+  let currentDS = [];
+  let chartScales = []; // { vmin, vmax } por gráfico
+
+  function svgLine(samples, def, idx) {
     if (samples.length < 2) {
-      return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="max-width:' + W + 'px;display:block">'
+      return '<svg viewBox="0 0 ' + SVG_W + ' ' + SVG_H + '" width="100%" style="max-width:' + SVG_W + 'px;display:block">'
            + '<text x="50%" y="50%" fill="#888" text-anchor="middle" font-family="system-ui" font-size="13">'
-           + label + ': datos insuficientes</text></svg>';
+           + def.label + ': datos insuficientes</text></svg>';
     }
-    const values = samples.map(s => s[key] == null ? 0 : s[key]);
+    const values = samples.map(s => s[def.key] == null ? 0 : s[def.key]);
     const ts = samples.map(s => s.ts);
     let vmin = Math.min.apply(null, values), vmax = Math.max.apply(null, values);
     if (vmax === vmin) vmax = vmin + 1;
     let tmin = ts[0], tmax = ts[ts.length - 1];
     if (tmax === tmin) tmax = tmin + 1;
-    const xp = t => padL + (t - tmin) / (tmax - tmin) * chartW;
-    const yp = v => padT + (1 - (v - vmin) / (vmax - vmin)) * chartH;
+    chartScales[idx] = { vmin, vmax };
+    const xp = t => PADL + (t - tmin) / (tmax - tmin) * CHARTW;
+    const yp = v => PADT + (1 - (v - vmin) / (vmax - vmin)) * CHARTH;
     const pts = ts.map((t, i) => xp(t).toFixed(1) + ',' + yp(values[i]).toFixed(1)).join(' ');
 
     let ticks = '';
     for (let i = 0; i < 4; i++) {
       const v = vmin + (vmax - vmin) * (i / 3);
       const y = yp(v);
-      ticks += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y.toFixed(1) + '" y2="' + y.toFixed(1)
+      ticks += '<line x1="' + PADL + '" x2="' + (SVG_W - PADR) + '" y1="' + y.toFixed(1) + '" y2="' + y.toFixed(1)
             + '" stroke="currentColor" stroke-opacity="0.08" stroke-width="1"/>'
-            + '<text x="' + (padL - 6) + '" y="' + (y + 4).toFixed(1)
+            + '<text x="' + (PADL - 6) + '" y="' + (y + 4).toFixed(1)
             + '" fill="currentColor" fill-opacity="0.55" text-anchor="end" font-size="10" font-family="system-ui">'
             + v.toFixed(0) + '</text>';
     }
     const span = tmax - tmin;
     const t0 = fmtTs(tmin, span), t1 = fmtTs(tmax, span);
 
-    return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" style="max-width:' + W + 'px;height:auto;display:block">'
-         + '<text x="' + padL + '" y="14" fill="currentColor" font-size="12" font-family="system-ui" font-weight="600">' + label + '</text>'
-         + '<text x="' + (W - padR) + '" y="14" fill="' + color + '" font-size="12" font-family="system-ui" text-anchor="end" font-variant-numeric="tabular-nums">'
+    return '<svg viewBox="0 0 ' + SVG_W + ' ' + SVG_H + '" width="100%" style="max-width:' + SVG_W + 'px;height:auto;display:block">'
+         + '<text x="' + PADL + '" y="14" fill="currentColor" font-size="12" font-family="system-ui" font-weight="600">' + def.label + '</text>'
+         + '<text x="' + (SVG_W - PADR) + '" y="14" fill="' + def.color + '" font-size="12" font-family="system-ui" text-anchor="end" font-variant-numeric="tabular-nums">'
          + values[values.length - 1].toFixed(1) + '</text>'
          + ticks
-         + '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>'
-         + '<text x="' + padL + '" y="' + (H - 6) + '" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui">' + t0 + '</text>'
-         + '<text x="' + (W - padR) + '" y="' + (H - 6) + '" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui" text-anchor="end">' + t1 + '</text>'
+         + '<polyline fill="none" stroke="' + def.color + '" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" points="' + pts + '"/>'
+         + '<text x="' + PADL + '" y="' + (SVG_H - 6) + '" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui">' + t0 + '</text>'
+         + '<text x="' + (SVG_W - PADR) + '" y="' + (SVG_H - 6) + '" fill="currentColor" fill-opacity="0.55" font-size="10" font-family="system-ui" text-anchor="end">' + t1 + '</text>'
+         + '<line class="cursor-line" x1="0" x2="0" y1="' + PADT + '" y2="' + (SVG_H - PADB) + '" stroke="' + def.color + '" stroke-opacity="0.5" stroke-width="1" stroke-dasharray="3 2" visibility="hidden"/>'
+         + '<circle class="cursor-dot" cx="0" cy="0" r="3.5" fill="' + def.color + '" stroke="var(--card)" stroke-width="1.5" visibility="hidden"/>'
+         + '<rect class="cursor-overlay" x="' + PADL + '" y="' + PADT + '" width="' + CHARTW + '" height="' + CHARTH + '" fill="transparent"/>'
          + '</svg>';
   }
 
@@ -499,12 +528,104 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   function renderCharts(samples) {
     const enriched = samples.map(s => Object.assign({}, s, { cpu_used: s.cpu_idle == null ? null : 100 - s.cpu_idle }));
     const ds = downsample(enriched, 800);
-    document.getElementById('charts').innerHTML = [
-      '<div class="chart-card">' + svgLine(ds, 'ram_free_mb', 'RAM libre (MB)', '#7aa2f7') + '</div>',
-      '<div class="chart-card">' + svgLine(ds, 'ram_compressed_mb', 'Compresor (MB)', '#e0af68') + '</div>',
-      '<div class="chart-card">' + svgLine(ds, 'cpu_used', 'CPU usado (%)', '#f7768e') + '</div>',
-      '<div class="chart-card">' + svgLine(ds, 'load_1', 'Load avg (1 min)', '#9ece6a') + '</div>',
-    ].join('');
+    currentDS = ds;
+    chartScales = [];
+    document.getElementById('charts').innerHTML = CHART_DEFS.map((def, idx) =>
+      '<div class="chart-card" data-idx="' + idx + '">'
+      + svgLine(ds, def, idx)
+      + '<div class="chart-tooltip"></div>'
+      + '</div>'
+    ).join('');
+    attachChartListeners();
+  }
+
+  function findClosestIdx(arr, ts) {
+    let lo = 0, hi = arr.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].ts < ts) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(arr[lo - 1].ts - ts) < Math.abs(arr[lo].ts - ts)) return lo - 1;
+    return lo;
+  }
+
+  function updateCursors(sampleIdx, activeCard, clientX, clientY) {
+    if (!currentDS.length || sampleIdx < 0 || sampleIdx >= currentDS.length) return;
+    const sample = currentDS[sampleIdx];
+    const tmin = currentDS[0].ts;
+    const tmax = currentDS[currentDS.length - 1].ts;
+    const tspan = (tmax - tmin) || 1;
+    const xInVB = PADL + (sample.ts - tmin) / tspan * CHARTW;
+
+    const cards = document.querySelectorAll('#charts .chart-card');
+    cards.forEach((card, idx) => {
+      const svg = card.querySelector('svg');
+      if (!svg) return;
+      const line = svg.querySelector('.cursor-line');
+      const dot = svg.querySelector('.cursor-dot');
+      const tooltip = card.querySelector('.chart-tooltip');
+      const def = CHART_DEFS[idx];
+      const scale = chartScales[idx];
+      const v = sample[def.key];
+
+      if (line) {
+        line.setAttribute('x1', xInVB);
+        line.setAttribute('x2', xInVB);
+        line.setAttribute('visibility', 'visible');
+      }
+      if (dot && v != null && scale) {
+        const yVB = PADT + (1 - (v - scale.vmin) / ((scale.vmax - scale.vmin) || 1)) * CHARTH;
+        dot.setAttribute('cx', xInVB);
+        dot.setAttribute('cy', yVB);
+        dot.setAttribute('visibility', 'visible');
+      } else if (dot) {
+        dot.setAttribute('visibility', 'hidden');
+      }
+
+      if (card === activeCard && tooltip) {
+        const span = tmax - tmin;
+        tooltip.innerHTML = '<div class="ts">' + fmtTs(sample.ts, span) + '</div>'
+                          + def.label + ': <b>' + (v == null ? '—' : fmt(v, def.digits)) + '</b>';
+        const cardRect = card.getBoundingClientRect();
+        let left = clientX - cardRect.left + 12;
+        let top = clientY - cardRect.top + 12;
+        // Mantener el tooltip dentro de la tarjeta.
+        const ttW = tooltip.offsetWidth || 140;
+        if (left + ttW > cardRect.width - 6) left = clientX - cardRect.left - ttW - 12;
+        if (top < 6) top = 6;
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+        tooltip.classList.add('show');
+      } else if (tooltip) {
+        tooltip.classList.remove('show');
+      }
+    });
+  }
+
+  function hideCursors() {
+    document.querySelectorAll('#charts .cursor-line, #charts .cursor-dot').forEach(el => el.setAttribute('visibility', 'hidden'));
+    document.querySelectorAll('#charts .chart-tooltip').forEach(el => el.classList.remove('show'));
+  }
+
+  function attachChartListeners() {
+    const cards = document.querySelectorAll('#charts .chart-card');
+    cards.forEach(card => {
+      const svg = card.querySelector('svg');
+      if (!svg || !currentDS.length) return;
+      const tmin = currentDS[0].ts;
+      const tmax = currentDS[currentDS.length - 1].ts;
+      const tspan = (tmax - tmin) || 1;
+
+      svg.addEventListener('mousemove', evt => {
+        const rect = svg.getBoundingClientRect();
+        const xVB = (evt.clientX - rect.left) / rect.width * SVG_W;
+        if (xVB < PADL || xVB > SVG_W - PADR) { hideCursors(); return; }
+        const ts = tmin + (xVB - PADL) / CHARTW * tspan;
+        const idx = findClosestIdx(currentDS, ts);
+        updateCursors(idx, card, evt.clientX, evt.clientY);
+      });
+      svg.addEventListener('mouseleave', hideCursors);
+    });
   }
 
   function renderTopApps(rows) {
